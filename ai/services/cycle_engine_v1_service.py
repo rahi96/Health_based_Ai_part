@@ -1302,12 +1302,17 @@ def _cycle_state(user_id: int) -> dict[str, Any]:
         })
 
     # Convert MySQL period_logs to expected format
+    # Skip rows without a period_start_date (e.g. calendar-only cycles that
+    # haven't logged an actual period yet) so downstream date parsing never
+    # sees a None value.
     backend_periods = []
     for log in db_snapshot.get("period_logs") or []:
+        if not log.get("period_start_date"):
+            continue
         backend_periods.append({
             "id": log.get("id"),
             "user_id": user_id,
-            "start_date": str(log.get("period_start_date"))[:10] if log.get("period_start_date") else None,
+            "start_date": str(log.get("period_start_date"))[:10],
             "end_date": str(log.get("period_end_date"))[:10] if log.get("period_end_date") else None,
             "cycle_length": log.get("cycle_length"),
         })
