@@ -1,12 +1,7 @@
 import json
 import time
-from io import BytesIO
 from typing import Any
-from urllib.parse import urlparse
 
-import httpx
-
-from ai.config import settings
 from ai.models.pdf_summary_models import (
     HormonalPanelSummary,
     HormoneAiInsights,
@@ -59,13 +54,18 @@ def get_lab_reports_for_user(user_id: int) -> dict[str, Any]:
 
 
 def summarize_pdf(user_id: int, report_id: int | None = None) -> PdfSummaryResponse:
-    """Summarize lab report PDF for a user from database."""
-    # Get lab reports from database
+    """Summarize lab report for a user using only data already in MySQL.
+
+    This never fetches the PDF file over HTTP. If the report's biomarkers
+    have already been analyzed and stored in the `lab_reports` table, that
+    stored analysis is returned. Otherwise a fallback summary is returned
+    with `analysis_status` reflecting the database state (pending/processing/failed).
+    """
     reports = get_lab_reports(user_id)
-    
+
     if not reports:
         raise ValueError(f"No lab reports found for user {user_id}")
-    
+
     # Find specific report or use latest
     if report_id:
         report = next((r for r in reports if r["id"] == report_id), None)
@@ -73,28 +73,11 @@ def summarize_pdf(user_id: int, report_id: int | None = None) -> PdfSummaryRespo
             raise ValueError(f"Lab report {report_id} not found for user {user_id}")
     else:
         report = reports[0]  # Latest report
-    
-    # If report already has AI analysis, return it
-    if report.get("analysis_status") == "completed" and report.get("biomarkers"):
-        return _build_response_from_db(report)
-    
-    # Otherwise fetch PDF and analyze
-    pdf_path = report.get("lab_report")
-    if not pdf_path:
-        raise ValueError(f"No PDF file path for report {report['id']}")
-    
-    pdf_content, content_type, source = _fetch_pdf_from_storage(pdf_path)
-    report_text = _extract_pdf_text(pdf_content)
-    summary = _generate_hormonal_panel_summary(report_text)
 
-    return PdfSummaryResponse(
-        report_id=report["id"],
-        source_path=source,
-        content_type=content_type,
-        file_size_bytes=len(pdf_content),
-        text_extracted=bool(report_text.strip()),
-        summary=summary,
-    )
+    if report.get("biomarkers"):
+        return _build_response_from_db(report)
+
+    return _build_pending_response(report)
 
 
 def _build_response_from_db(report: dict[str, Any]) -> PdfSummaryResponse:
@@ -111,6 +94,7 @@ def _build_response_from_db(report: dict[str, Any]) -> PdfSummaryResponse:
     if isinstance(next_steps_data, str):
         next_steps_data = json.loads(next_steps_data)
     
+    default_note = "Not available for this lab report."
     summary = HormonalPanelSummary(
         panel=report.get("panel") or "Hormonal Panel",
         biomarkers=HormoneBiomarkers(
@@ -121,13 +105,25 @@ def _build_response_from_db(report: dict[str, Any]) -> PdfSummaryResponse:
                 HormoneBiomarker(**b) for b in biomarkers_data.get("normal_results", [])
             ],
         ),
-        ai_insights=HormoneAiInsights(**ai_insights_data) if ai_insights_data else None,
-        next_steps=HormoneNextSteps(**next_steps_data) if next_steps_data else None,
+        ai_insights=HormoneAiInsights(
+            cross_data_context=ai_insights_data.get("cross_data_context", []),
+            estradiol_elevation=ai_insights_data.get("estradiol_elevation", default_note),
+            cortisol_near_ceiling=ai_insights_data.get("cortisol_near_ceiling", default_note),
+            hormonal_balance=ai_insights_data.get("hormonal_balance", default_note),
+        ),
+        next_steps=HormoneNextSteps(
+            recommendations=next_steps_data.get("recommendations", []),
+            medical_disclaimer=next_steps_data.get(
+                "medical_disclaimer",
+                "This AI summary is for informational purposes only and is not medical advice. "
+                "A qualified healthcare professional should interpret abnormal or concerning lab results.",
+            ),
+        ),
     )
     
     return PdfSummaryResponse(
         report_id=report["id"],
-        source_path=report.get("lab_report"),
+        source_path=report.get("lab_report") or "",
         content_type="application/pdf",
         file_size_bytes=0,
         text_extracted=True,
@@ -135,28 +131,62 @@ def _build_response_from_db(report: dict[str, Any]) -> PdfSummaryResponse:
     )
 
 
-def _fetch_pdf_from_storage(pdf_path: str) -> tuple[bytes, str, str]:
-    """Fetch PDF from Laravel storage via backend URL."""
-    # Construct full URL to fetch PDF from Laravel storage
-    base_url = settings.BACKEND_URL.rstrip("/")
-    # Remove /api/v1 suffix if present for storage URL
-    storage_base = base_url.rsplit("/api", 1)[0]
-    pdf_url = f"{storage_base}/storage/{pdf_path}"
-    
-    response = _get_backend_response(pdf_url)
-    content_type = response.headers.get("content-type", "application/pdf")
-    return response.content, content_type, pdf_url
+def _build_pending_response(report: dict[str, Any]) -> PdfSummaryResponse:
+    """Build a placeholder response when biomarkers haven't been analyzed yet.
+
+    Uses only the `analysis_status` column already in MySQL - no HTTP calls.
+    """
+    status = report.get("analysis_status") or "pending"
+    status_messages = {
+        "pending": "This lab report has not been analyzed yet.",
+        "processing": "This lab report is currently being analyzed.",
+        "failed": "Analysis of this lab report failed. Please try uploading it again.",
+    }
+    message = status_messages.get(status, "No analysis is available for this lab report yet.")
+
+    summary = HormonalPanelSummary(
+        panel=report.get("panel") or "Hormonal Panel",
+        biomarkers=HormoneBiomarkers(needs_attention=[], normal_results=[]),
+        ai_insights=HormoneAiInsights(
+            cross_data_context=[],
+            estradiol_elevation=message,
+            cortisol_near_ceiling=message,
+            hormonal_balance=message,
+        ),
+        next_steps=HormoneNextSteps(
+            recommendations=[],
+            medical_disclaimer=(
+                "This AI summary is for informational purposes only and is not medical advice. "
+                "A qualified healthcare professional should interpret abnormal or concerning lab results."
+            ),
+        ),
+    )
+
+    return PdfSummaryResponse(
+        report_id=report["id"],
+        source_path=report.get("lab_report") or "",
+        content_type="application/pdf",
+        file_size_bytes=0,
+        text_extracted=False,
+        summary=summary,
+    )
+
 
 def fetch_chat_lab_report_context(user_id: int, report_id: int | None = None) -> dict[str, Any]:
-    """Fetch lab report context for chat from database."""
+    """Fetch lab report context for chat using only data already in MySQL.
+
+    Never fetches the PDF file over HTTP. Returns the stored biomarkers/
+    ai_insights/next_steps JSON columns when available, or the analysis
+    status otherwise.
+    """
     reports = get_lab_reports(user_id)
-    
+
     if not reports:
         return {
             "report_id": None,
             "error": f"No lab reports found for user {user_id}",
         }
-    
+
     # Find specific report or use latest
     if report_id:
         report = next((r for r in reports if r["id"] == report_id), None)
@@ -167,56 +197,34 @@ def fetch_chat_lab_report_context(user_id: int, report_id: int | None = None) ->
             }
     else:
         report = reports[0]
-    
-    pdf_path = report.get("lab_report")
-    if not pdf_path:
+
+    if not report.get("biomarkers"):
         return {
             "report_id": report["id"],
-            "error": "No PDF file path for report",
-        }
-    
-    try:
-        pdf_content, content_type, source = _fetch_pdf_from_storage(pdf_path)
-        report_text = _extract_pdf_text(pdf_content)
-        clipped_text = report_text[:MAX_CHAT_PDF_TEXT_CHARS]
-        return {
-            "report_id": report["id"],
-            "source_path": source,
-            "content_type": content_type,
-            "file_size_bytes": len(pdf_content),
-            "text_extracted": bool(report_text.strip()),
-            "extracted_text_characters": len(report_text),
-            "extracted_text_truncated": len(report_text) > MAX_CHAT_PDF_TEXT_CHARS,
-            "extracted_text": clipped_text,
-        }
-    except Exception as e:
-        return {
-            "report_id": report["id"],
-            "error": str(e),
+            "analysis_status": report.get("analysis_status") or "pending",
+            "text_extracted": False,
+            "note": "No AI analysis has been stored yet for this lab report.",
         }
 
+    biomarkers_data = report.get("biomarkers") or {}
+    ai_insights_data = report.get("ai_insights") or {}
+    next_steps_data = report.get("next_steps") or {}
+    if isinstance(biomarkers_data, str):
+        biomarkers_data = json.loads(biomarkers_data)
+    if isinstance(ai_insights_data, str):
+        ai_insights_data = json.loads(ai_insights_data)
+    if isinstance(next_steps_data, str):
+        next_steps_data = json.loads(next_steps_data)
 
-def fetch_backend_pdf(report_id: int | None = None) -> tuple[bytes, str, str, int | None]:
-    source = settings.LAB_REPORTS_URL
-    response = _get_backend_response(source)
-    content_type = response.headers.get("content-type", "application/octet-stream")
-    content = response.content
-
-    if _is_pdf_response(content_type, content):
-        return content, content_type, source, report_id
-
-    if "json" not in content_type.lower():
-        raise ValueError("Backend route did not return a PDF file")
-
-    pdf_source, resolved_report_id = _extract_pdf_source(response.json(), report_id)
-    pdf_response = _get_backend_response(pdf_source)
-    pdf_content_type = pdf_response.headers.get("content-type", "application/octet-stream")
-    pdf_content = pdf_response.content
-
-    if not _is_pdf_response(pdf_content_type, pdf_content):
-        raise ValueError("Backend lab report link did not return a PDF file")
-
-    return pdf_content, pdf_content_type, pdf_source, resolved_report_id
+    return {
+        "report_id": report["id"],
+        "analysis_status": report.get("analysis_status") or "completed",
+        "text_extracted": True,
+        "panel": report.get("panel") or "Hormonal Panel",
+        "biomarkers": biomarkers_data,
+        "ai_insights": ai_insights_data,
+        "next_steps": next_steps_data,
+    }
 
 
 def _generate_hormonal_panel_summary(report_text: str) -> HormonalPanelSummary:
@@ -474,152 +482,6 @@ def _find_biomarker(
 
 def _biomarker_key(name: str) -> str:
     return "".join(char for char in name.lower() if char.isalnum())
-
-
-def _extract_pdf_text(pdf_content: bytes) -> str:
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise RuntimeError("Install pypdf to extract lab report text from PDFs") from exc
-
-    reader = PdfReader(BytesIO(pdf_content))
-    pages = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-
-    return "\n\n".join(page for page in pages if page).strip()
-
-
-def _get_backend_response(path: str) -> httpx.Response:
-    url = _backend_url(path)
-
-    response = httpx.get(url, headers=_backend_headers(), timeout=30.0, follow_redirects=True)
-    response.raise_for_status()
-    return response
-
-
-def _backend_headers() -> dict[str, str]:
-    headers = {
-        "Accept": "application/json",
-        "ngrok-skip-browser-warning": "true",
-    }
-
-    token = settings.CYCLE_ENGINE_ACCESS_TOKEN or settings.BACKEND_ACCESS_TOKEN
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-        headers["access-token"] = token
-        headers["x-access-token"] = token
-
-    return headers
-
-
-def _is_pdf_response(content_type: str, content: bytes) -> bool:
-    return "application/pdf" in content_type.lower() or content.startswith(b"%PDF")
-
-
-def _extract_pdf_source(payload: Any, report_id: int | None = None) -> tuple[str, int | None]:
-    candidates: list[tuple[str, int | None]] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            pdf_source = _pdf_source_from_record(value)
-            candidate_id = _extract_report_id(value)
-            if pdf_source:
-                candidates.append((pdf_source, candidate_id))
-
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(payload)
-
-    if report_id is not None:
-        for candidate, candidate_id in candidates:
-            if candidate_id == report_id:
-                return candidate, candidate_id
-        raise ValueError(f"Backend lab reports response did not include lab report id {report_id}")
-
-    for candidate, candidate_id in candidates:
-        if ".pdf" in candidate.lower():
-            return candidate, candidate_id
-    if candidates:
-        return candidates[0]
-
-    raise ValueError("Backend lab reports response did not include a PDF link")
-
-
-def _pdf_source_from_record(record: dict) -> str | None:
-    preferred: list[str] = []
-    fallback: list[str] = []
-
-    for key, child in record.items():
-        key_name = str(key).lower()
-        if not isinstance(child, str):
-            continue
-        if not any(marker in key_name for marker in ("lab_report", "pdf", "file", "url", "path", "document")):
-            continue
-        if ".pdf" in child.lower():
-            preferred.append(child)
-        else:
-            fallback.append(child)
-
-    if preferred:
-        return preferred[0]
-    if fallback:
-        return fallback[0]
-    return None
-
-
-def _extract_report_id(record: dict) -> int | None:
-    for key in ("id", "lab_report_id", "report_id"):
-        value = record.get(key)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _backend_url(path: str) -> str:
-    cleaned = path.strip()
-    if not cleaned:
-        raise ValueError("Backend path is required")
-    if cleaned.startswith(("http://", "https://")):
-        if not _is_allowed_backend_url(cleaned):
-            raise ValueError("Full URLs are only allowed for configured lab report resources")
-        return cleaned
-
-    normalized_path = _normalize_backend_path(cleaned)
-    if normalized_path.startswith("/storage/"):
-        return f"{_lab_reports_origin()}{normalized_path}"
-    return f"{settings.BACKEND_URL.rstrip('/')}{normalized_path}"
-
-
-def _is_allowed_backend_url(url: str) -> bool:
-    if url == settings.LAB_REPORTS_URL:
-        return True
-
-    parsed = urlparse(url)
-    lab_reports = urlparse(settings.LAB_REPORTS_URL)
-    return (
-        parsed.scheme in {"http", "https"}
-        and parsed.netloc == lab_reports.netloc
-        and parsed.path.startswith("/storage/")
-        and parsed.path.lower().endswith(".pdf")
-    )
-
-
-def _lab_reports_origin() -> str:
-    parsed = urlparse(settings.LAB_REPORTS_URL)
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def _normalize_backend_path(path: str) -> str:
-    if not path.startswith("/"):
-        return f"/{path}"
-    return path
 
 
 def _is_retryable_llm_error(exc: Exception) -> bool:
